@@ -1,0 +1,9 @@
+[project]
+name = "json-parser"
+version = "0.1.0"
+description = "JSON 解析与可视化工具，支持命令行与图形界面两种模式"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyside6>=6.5",
+]
