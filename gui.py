@@ -7,13 +7,16 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QModelIndex
-from PySide6.QtGui import QAction, QFont, QColor, QStandardItem, QStandardItemModel
+from PySide6.QtCore import Qt, QModelIndex, QSize, QRect
+from PySide6.QtGui import (
+    QAction, QFont, QColor, QStandardItem, QStandardItemModel,
+    QTextCursor, QTextCharFormat, QPainter,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QSplitter, QPushButton, QTextEdit, QTreeView, QLineEdit,
-    QLabel, QStatusBar, QFileDialog, QMessageBox, QTabWidget,
-    QHeaderView, QMenuBar, QGroupBox, QSizePolicy,
+    QSplitter, QPushButton, QTextEdit, QPlainTextEdit, QTreeView,
+    QLineEdit, QLabel, QStatusBar, QFileDialog, QMessageBox,
+    QTabWidget, QHeaderView, QMenuBar, QGroupBox, QSizePolicy,
 )
 
 from core import JsonParser
@@ -88,6 +91,202 @@ class JsonTreeModel(QStandardItemModel):
             parent.appendRow([key_item, val_item, tp_item])
 
 
+class LineNumberArea(QWidget):
+    """行号栏画布,绘制工作委托给 CodeEdit 完成"""
+
+    def __init__(self, editor: "CodeEdit"):
+        super().__init__(editor)
+        self._editor = editor
+
+    def sizeHint(self) -> QSize:
+        """行号栏推荐宽度由编辑器决定"""
+        return QSize(self._editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        """将绘制事件转发给编辑器"""
+        self._editor.line_number_area_paint_event(event)
+
+
+class CodeEdit(QPlainTextEdit):
+    """带行号栏 + 括号配对高亮的源文本编辑器"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._line_number_area = LineNumberArea(self)
+        # 两组高亮分开管理,合并应用以共存:
+        #   _extra_selections    外部设置的高亮(如错误行)
+        #   _bracket_selections  括号配对高亮(光标移动时自动更新)
+        self._extra_selections: list = []
+        self._bracket_selections: list = []
+        # 行数变化时更新行号栏宽度;滚动/内容变化时刷新行号
+        self.blockCountChanged.connect(self._update_line_number_width)
+        self.updateRequest.connect(self._update_line_number_area)
+        # 光标移动时高亮配对括号
+        self.cursorPositionChanged.connect(self._highlight_matching_bracket)
+        self._update_line_number_width(0)
+
+    def setExtraSelections(self, selections):
+        """重写:外部设置的高亮存入 _extra_selections,与括号高亮合并应用"""
+        self._extra_selections = list(selections)
+        self._apply_all_selections()
+
+    def _apply_all_selections(self):
+        """合并错误高亮 + 括号高亮,调用父类 setExtraSelections"""
+        super().setExtraSelections(self._extra_selections + self._bracket_selections)
+
+    # ─── 括号配对高亮 ───────────────────────────────────────
+    def _highlight_matching_bracket(self):
+        """光标停在括号旁时,高亮对应的配对括号"""
+        cursor = self.textCursor()
+        pos = cursor.position()
+        doc = self.document()
+        n = doc.characterCount()
+
+        # 候选括号:优先看光标左边字符,再看右边字符
+        candidates: list[tuple[int, str]] = []
+        if pos > 0:
+            ch = str(doc.characterAt(pos - 1))
+            if ch in '([{)]}':
+                candidates.append((pos - 1, ch))
+        if pos < n - 1:
+            ch = str(doc.characterAt(pos))
+            if ch in '([{)]}':
+                candidates.append((pos, ch))
+
+        if not candidates:
+            self._bracket_selections = []
+            self._apply_all_selections()
+            return
+
+        start_pos, start_ch = candidates[0]
+        match_pos = self._find_matching_bracket(doc, start_pos, start_ch)
+
+        if match_pos is None:
+            self._bracket_selections = []
+            self._apply_all_selections()
+            return
+
+        # 高亮两个括号字符(暗橄榄绿背景,与错误行的暗红不冲突)
+        bg = QColor("#4b6b2f")
+        self._bracket_selections = [
+            self._make_char_selection(doc, start_pos, bg),
+            self._make_char_selection(doc, match_pos, bg),
+        ]
+        self._apply_all_selections()
+
+    @staticmethod
+    def _make_char_selection(doc, pos: int, color: QColor):
+        """构造单个字符的高亮(ExtraSelection)"""
+        sel = QTextEdit.ExtraSelection()
+        sel.cursor = QTextCursor(doc)
+        sel.cursor.setPosition(pos)
+        sel.cursor.movePosition(
+            QTextCursor.MoveOperation.Right,
+            QTextCursor.MoveMode.KeepAnchor,
+            1,
+        )
+        sel.format.setBackground(color)
+        return sel
+
+    def _find_matching_bracket(self, doc, pos: int, ch: str):
+        """从 pos 处的括号 ch 出发,查找配对括号位置,跳过字符串内括号"""
+        opens = '([{'
+        closes = ')]}'
+        pair = dict(zip(opens, closes)) | dict(zip(closes, opens))
+
+        forward = ch in opens          # 开括号向右找,闭括号向左找
+        target = pair[ch]
+        step = 1 if forward else -1
+        n = doc.characterCount()
+
+        depth = 0
+        in_string = False
+        escape = False
+        i = pos + step
+        while 0 <= i < n - 1:
+            c = str(doc.characterAt(i))
+            if in_string:
+                if escape:
+                    escape = False
+                elif c == '\\':
+                    escape = True
+                elif c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c == ch:                 # 同类括号,嵌套+1
+                    depth += 1
+                elif c == target:             # 配对括号
+                    if depth == 0:
+                        return i
+                    depth -= 1
+            i += step
+        return None
+
+    def line_number_area_width(self) -> int:
+        """根据当前行数计算行号栏所需宽度"""
+        digits = max(1, len(str(self.blockCount())))
+        return 8 + self.fontMetrics().horizontalAdvance('9') * digits
+
+    def resizeEvent(self, e):
+        """窗口尺寸变化时同步调整行号栏几何"""
+        super().resizeEvent(e)
+        cr = self.contentsRect()
+        self._line_number_area.setGeometry(
+            cr.left(), cr.top(),
+            self.line_number_area_width(), cr.height()
+        )
+
+    def line_number_area_paint_event(self, event):
+        """绘制行号栏:深色背景 + 灰色行号"""
+        painter = QPainter(self._line_number_area)
+        painter.fillRect(event.rect(), QColor("#1e1e1e"))
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        # QPlainTextEdit.blockBoundingGeometry 只接受 1 个参数,
+        # 需配合 contentOffset() 转换到视口坐标
+        top = round(
+            self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        )
+        bottom = top + round(self.blockBoundingRect(block).height())
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(block_number + 1)
+                painter.setPen(QColor("#858585"))
+                painter.drawText(
+                    0, top,
+                    self._line_number_area.width(),
+                    self.fontMetrics().height(),
+                    Qt.AlignRight,
+                    number,
+                )
+            block = block.next()
+            block_number += 1
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            if not block.isValid():
+                break
+
+    def _update_line_number_width(self, _):
+        """行数变化时调整视口左边界,给行号栏留出空间"""
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def _update_line_number_area(self, rect, dy):
+        """响应滚动/内容变化,同步刷新行号栏"""
+        if dy:
+            self._line_number_area.scroll(0, dy)
+        else:
+            self._line_number_area.update(
+                0, rect.y(),
+                self._line_number_area.width(), rect.height()
+            )
+        # 若变化波及整个视口,重新计算行号栏宽度
+        if rect.contains(self.viewport().rect()):
+            self._update_line_number_width(0)
+
+
 class JsonViewer(QMainWindow):
     """JSON 解析器主窗口"""
 
@@ -134,12 +333,12 @@ class JsonViewer(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         lbl_src = QLabel("JSON 源文本")
         lbl_src.setStyleSheet("font-weight: bold; margin-bottom: 2px;")
-        self.source_edit = QTextEdit()
+        self.source_edit = CodeEdit()
         self.source_edit.setPlaceholderText("在此粘贴 JSON 文本，或点击「打开文件」加载...")
         font = QFont("Consolas", 11)
         self.source_edit.setFont(font)
         self.source_edit.setStyleSheet("""
-            QTextEdit {
+            QPlainTextEdit {
                 background-color: #1e1e1e;
                 color: #d4d4d4;
                 border: 1px solid #3c3c3c;
@@ -374,8 +573,145 @@ class JsonViewer(QMainWindow):
         except (KeyError, TypeError, IndexError) as e:
             self.status_bar.showMessage(f"取值失败: {e}")
 
+    # ─── 出错行高亮与定位 ─────────────────────────────────────
+    def _highlight_error_line(self, lineno: int, colno: int = 0):
+        """高亮出错行并把光标跳转到出错位置"""
+        doc = self.source_edit.document()
+        # Qt 的行号从 0 开始,JSONDecodeError.lineno 从 1 开始,需减 1
+        block = doc.findBlockByLineNumber(lineno - 1)
+        if not block.isValid():
+            return
+        # 1) 整行暗红高亮(ExtraSelection)
+        # 注意:PySide6 中 QPlainTextEdit 未绑定 ExtraSelection 嵌套类,
+        # 需用 QTextEdit.ExtraSelection(QPlainTextEdit.setExtraSelections 仍可接受)
+        sel = QTextEdit.ExtraSelection()
+        sel.cursor = QTextCursor(block)
+        sel.cursor.select(QTextCursor.SelectionType.LineUnderCursor)
+        sel.format.setBackground(QColor("#8b0000"))
+        self.source_edit.setExtraSelections([sel])
+        # 2) 光标定位到具体列号(便于用户直接看到出错字符)
+        #    JSONDecodeError.colno 从 1 开始,光标 position 从 0 开始,需减 1
+        cursor = QTextCursor(block)
+        colno_safe = max(0, colno - 1)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.Right,
+            QTextCursor.MoveMode.MoveAnchor,
+            colno_safe,
+        )
+        self.source_edit.setTextCursor(cursor)
+        self.source_edit.ensureCursorVisible()
+
+    def _clear_error_highlight(self):
+        """清除上次的出错行高亮"""
+        self.source_edit.setExtraSelections([])
+
+    # ─── 括号配对预检查 ───────────────────────────────────────
+    def _find_bracket_error(self, text: str):
+        """
+        扫描文本检查括号配对,返回 (lineno, colno, msg) 或 None。
+
+        策略:
+        1. 栈配对(基础):找出"多余的闭括号"、"括号类型不匹配"、
+           "文件末尾仍未闭合的开括号"。这些是确定性的错误。
+        2. 缩进辅助(增强,延迟决策):JSON 缩进良好时,`}` 的缩进应
+           等于配对 `{` 的缩进。若遇到 `}` 缩进严格小于栈顶 `{` 的
+           缩进,说明栈顶 `{` 可能缺少了对应的 `}`(用户删了某个
+           `}` 导致后续 `}` 错位匹配)。但**不立即报错**,只记录候选
+           位置。扫描结束时,只有"确实发现括号配对问题"(栈非空或
+           类型不匹配)才报候选;若栈空说明只是缩进不规范,不报错,
+           交给 json.loads 兜底。避免对缩进不规范的合法 JSON 误报。
+
+        跳过字符串字面量内的括号。
+        """
+        # 闭括号 → 对应开括号
+        pair = {')': '(', ']': '[', '}': '{'}
+        # 栈元素:(开括号字符, 行号, 列号, 该行的缩进空白数)
+        stack: list[tuple[str, int, int, int]] = []
+        in_string = False  # 是否处于字符串字面量内
+        escape = False     # 字符串内是否处于转义状态(前一个字符是 \)
+        # 缩进辅助候选:(lineno, col, ch) 或 None。只记录最早触发的
+        indent_candidate = None
+
+        for lineno, line in enumerate(text.split('\n'), start=1):
+            # 计算行首缩进(前导空格/tab 数),用于缩进辅助判断
+            # tab 和空格混用时不完全准确,但同一文件风格一致即可比较
+            indent = len(line) - len(line.lstrip(' \t'))
+            for col, ch in enumerate(line, start=1):
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == '\\':
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                # 非字符串内:只识别双引号(JSON 标准字符串定界符)
+                if ch == '"':
+                    in_string = True
+                elif ch in '{[(':
+                    stack.append((ch, lineno, col, indent))
+                elif ch in ')]}':
+                    if not stack:
+                        return (lineno, col, f"多余的闭括号 '{ch}'")
+                    open_ch, open_lineno, open_col, open_indent = stack[-1]
+                    if open_ch != pair[ch]:
+                        # 类型不匹配(如 { 配 ]):若之前有缩进候选,
+                        # 优先报候选(更早察觉的真实错误位置);否则报当前
+                        if indent_candidate is not None:
+                            cl_lineno, cl_col, cl_ch = indent_candidate
+                            return (
+                                cl_lineno, cl_col,
+                                f"未闭合的 '{cl_ch}'"
+                                f"(第{cl_lineno}行第{cl_col}列)"
+                                f"—— 可能在此之后缺少对应的闭括号"
+                            )
+                        return (lineno, col,
+                                f"括号不匹配: '{open_ch}'"
+                                f"(第{open_lineno}行第{open_col}列) 与 '{ch}' 不配对")
+                    # 类型匹配,检查缩进辅助:
+                    # 若当前 } 缩进 < 栈顶 { 缩进,说明栈顶 { 可能缺少
+                    # 对应的 }。仅对花括号生效(方括号/圆括号同行居多)。
+                    # 只记录第一个候选,不立即报错(延迟决策)。
+                    if (ch == '}' and open_ch == '{'
+                            and indent < open_indent
+                            and indent_candidate is None):
+                        indent_candidate = (open_lineno, open_col, open_ch)
+                    stack.pop()
+
+        # 扫描结束,综合判断
+        if stack:
+            # 栈非空:确实有未闭合开括号
+            # 优先报缩进候选(更早察觉的位置),否则报栈顶
+            if indent_candidate is not None:
+                cl_lineno, cl_col, cl_ch = indent_candidate
+                return (
+                    cl_lineno, cl_col,
+                    f"未闭合的 '{cl_ch}'"
+                    f"(第{cl_lineno}行第{cl_col}列)"
+                    f"—— 可能在此之后缺少对应的闭括号"
+                )
+            open_ch, lineno, col, _ = stack[-1]
+            return (lineno, col,
+                    f"未闭合的 '{open_ch}'(可能缺少对应的闭括号)")
+        # 栈空:括号配对完整。即使有缩进候选,也说明只是缩进不规范,
+        # 不报错,交给 json.loads 兜底(避免对合法 JSON 误报)
+        return None
+
     # ─── 核心解析逻辑 ────────────────────────────────────────
     def _parse_json(self, text: str):
+        self._clear_error_highlight()
+        # BOM 兜底:剪贴板或部分编辑器可能插入 BOM,需剥除
+        text = text.lstrip("\ufeff")
+
+        # 括号预检查:对"删括号"类错误给出更准确的位置
+        bracket_err = self._find_bracket_error(text)
+        if bracket_err is not None:
+            lineno, colno, msg = bracket_err
+            self._highlight_error_line(lineno, colno)
+            QMessageBox.warning(self, "JSON 括号错误",
+                f"第 {lineno} 行，第 {colno} 列:\n{msg}")
+            return
+
         try:
             self.parser = JsonParser.from_string(text)
             self.tree_model.load_data(self.parser.data)
@@ -393,7 +729,14 @@ class JsonViewer(QMainWindow):
                 }
             """)
         except json.JSONDecodeError as e:
+            self._highlight_error_line(e.lineno, e.colno)
             QMessageBox.warning(self, "JSON 解析错误", f"第 {e.lineno} 行，第 {e.colno} 列:\n{e.msg}")
+        except TypeError as e:
+            QMessageBox.warning(self, "类型错误", f"输入类型无效(可能传入了非字符串):\n{e}")
+        except ValueError as e:
+            QMessageBox.warning(self, "数值/格式错误", str(e))
+        except Exception as e:
+            QMessageBox.critical(self, "未预期的错误", f"{type(e).__name__}: {e}")
 
 
 # ─── 入口 ────────────────────────────────────────────────────
